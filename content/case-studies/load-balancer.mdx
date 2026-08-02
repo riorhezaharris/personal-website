@@ -1,0 +1,70 @@
+---
+title: "Load Balancer"
+oneLiner: "Zero-downtime failover across backend nodes."
+---
+
+## The problem
+
+Imagine a restaurant with three kitchens sharing one waitstaff. Every order that comes in has to go to *some* kitchen — but which one? Send everything to Kitchen A and it burns out while B and C sit idle. Send them round-robin regardless of how backed up each kitchen is, and you'll happily keep feeding orders to the kitchen that's on fire.
+
+That's the load balancing problem: given one door and several rooms behind it, how do you decide, per request, which room to send someone into — and how do you notice when a room stops answering?
+
+This project is a reverse proxy that sits in front of a pool of backend servers and answers that question five different ways — round robin, weighted round robin, least connections, least response time, and consistent hashing — letting you switch the answer live, over an HTTP admin API, without restarting anything.
+
+## Why it matters
+
+Every real traffic-routing decision is a bet about the *future* state of a backend, made with *past* information. Round robin bets that all backends are equally capable. Least connections bets that connection count predicts load. Consistent hashing bets that the same client should keep landing in the same place. Getting the bet wrong under real load is how "slow" becomes "down," and how a single degraded instance takes the whole pool down with it via cascading retries.
+
+That's not a hypothetical failure mode — it's the default outcome of the simplest possible router. A round-robin balancer with no health awareness will cheerfully send a third of your traffic into a backend that's already timing out, because "cheerfully send equal shares to everyone" is all it knows how to do. The interesting engineering isn't routing traffic when everything's healthy — any strategy does that fine. It's noticing when a backend stops being a safe bet, in time to stop betting on it, without a human watching a dashboard and flipping a switch by hand. A load balancer is where that decision gets made thousands of times a second, so its design choices are never neutral.
+
+## Key design decisions
+
+**Making the routing algorithm swappable without restarting the process.** The core interface here is deliberately small — `Next(r)` picks a backend, `OnRequestComplete(b, duration)` reports back what happened. That second method is the one that's easy to skip and expensive to skip wrong: strategies like least connections or least response time aren't stateless math, they need to know when a request *finishes*, not just when it starts, to keep their internal picture of each backend accurate. Putting that lifecycle in the interface itself — rather than letting stateful strategies track completion on the side — means every strategy has to implement both methods, even round robin, which just no-ops the hook. That's a small tax paid by the simple strategies so the complex ones can't cheat. The payoff: strategies hot-swap via a single HTTP call, guarded by a `sync.RWMutex` around the active strategy pointer. In-flight requests finish on whatever strategy dispatched them; the next request picks up the new one. No dropped connections, no restart, no coordination dance.
+
+**Weighted routing that's smooth, not bursty.** The naive way to give one backend twice the traffic of another is to list it twice in a rotation: `A A A B B B C C`. It's correct in aggregate but wrong in the moment — if you only send ten requests before checking in, they all land during A's burst. This uses the algorithm Nginx uses instead: each backend carries a running "current weight" that gets bumped by its own weight every round and drained by the total whenever it's picked, so a 5:3:2 ratio comes out interleaved — `A A B A C A B A B C` — rather than clumped. Same long-run distribution, but no window of traffic where the math hasn't caught up yet. That matters most exactly when it's hardest to notice: low-traffic periods, where "correct in aggregate" isn't a real guarantee, it's a promise that only pays off if you wait long enough.
+
+**Deciding what "slow" means without a memory leak.** For latency-based routing, the obvious approaches both have a flaw: a running average never forgets, so one slow blip permanently taxes a backend's score forever; a sliding window fixes that but costs a ring buffer per backend. This uses an exponentially weighted moving average instead — every new sample pulls the score 10% of the way toward reality (`new = 0.1×sample + 0.9×old`), so recent behavior dominates and old spikes fade out on their own. It's the same technique HAProxy and Envoy use, and the whole thing collapses to a single `atomic.Int64` per backend storing nanoseconds, updated with a compare-and-swap loop — no lock, no `atomic.Float64`, no contention on the hot path.
+
+**Keeping a client's session sticky without a sticky topology.** Consistent hashing solves a specific failure mode of naive hashing (`hash(client) % N`): the moment N changes — a backend added or removed — nearly every client's hash-mod result shifts, and everyone gets reshuffled to a new backend at once. Instead, each backend gets mapped to 150 points on a ring (FNV-1a hash), and a client's key hashes onto the same ring; they route to the nearest point clockwise. Remove a backend, and only the clients who happened to land on *that* backend's points get reshuffled — everyone else's session stays put.
+
+**Keeping cached state honest across a hot-swap.** Most strategies read backend health directly on every `Next()` call, so a health flip is visible immediately — there's nothing to invalidate. Consistent hashing is the one strategy that can't afford that: rebuilding a sorted ring from scratch on every single request would be wasteful, so the ring is built once and only rebuilt when a backend's health changes. Wiring that rebuild trigger has a trap I ran into directly: if the health checker's callback closes over whichever strategy instance happened to be live at process startup, a runtime hot-swap into `consistent_hash` *later* silently detaches it — the checker keeps calling `RebuildRing()` on an orphaned instance nobody is routing through, while the actual live ring never updates, and a dead backend can keep receiving hashed traffic indefinitely. The fix is to never hold a strategy reference across time at all: the health checker asks the proxy for whichever strategy is live *right now*, type-asserts it, and rebuilds that one. It's a small change in code, but it's the difference between "hot-swappable" being true only if you happen to boot the process already pointed at consistent hashing, versus actually being true regardless of when you swap into it.
+
+## What I'd do differently
+
+- **The admin API has no auth.** Anyone who can reach port 9090 can hot-swap the routing strategy or fake a backend outage. Fine for a demo; a real deployment needs this behind mTLS or at minimum a shared secret.
+- **Health checks are binary and un-backed-off.** A backend is either healthy or not, polled on a flat 5-second interval regardless of how it's been behaving. There's no distinction between "briefly slow" and "actually down," and no half-open circuit-breaker state to test recovery gradually — a backend goes straight from excluded back to fully in rotation the instant one health probe succeeds.
+- **The EWMA smoothing factor is hardcoded, and the ADR says otherwise.** `docs/adr/0003-ewma-latency-tracking.md` claims α=0.1 "is the default but is configurable at startup." Reading `internal/backend/backend.go`, it's a `const` — there's no flag, no config, no way to change it without editing the source. It's a small gap, but it's exactly the kind of doc-vs-code drift that's worth naming out loud rather than letting a reviewer find it first.
+- **EWMA has a cold-start blind spot.** A backend that just recovered — or was just added — has no latency samples, so its average reads as `0`, which the least-response-time strategy reads as "fastest backend available" and floods it before a single real measurement comes in.
+- **Consistent hashing's client key is easy to collide or spoof.** It hashes on `X-Forwarded-For` if present, falling back to `RemoteAddr`. That means anyone behind a NAT or corporate egress can genuinely collide onto the same backend as a lot of other distinct users, *and* a client that sets its own `X-Forwarded-For` header can pick which point on the ring it wants to land on. A production version needs a key it can actually trust — a session token, or a header set only by a trusted upstream proxy, not the raw request as received from the client.
+- **The load balancer itself is a single point of failure.** This project solves distribution *behind* the proxy; it doesn't address who load-balances the load balancer. That's a DNS/anycast/keepalived problem this scope deliberately left out.
+
+None of these are things I didn't notice — they're places where "demonstrate the tradeoff" and "production-harden it" diverge, and I chose to spend the time on the former.
+
+## Try it yourself
+
+This is the least-response-time strategy shifting traffic away from a degraded backend in real time, recorded off a running local stack — not a mockup:
+
+![Terminal recording: round robin rotates evenly across three backends, then the strategy hot-swaps to least_response_time, backend2 is degraded with +500ms via the admin API, and the next eight requests land only on backend1 and backend3 — backend2 is never selected again until it recovers](/case-studies/load-balancer/least-response-time-demo.gif)
+
+```bash
+git clone https://github.com/riorhezaharris/load-balancer
+cd load-balancer
+docker compose up --build
+```
+
+Then watch traffic shift live:
+
+```bash
+curl -X POST localhost:9090/admin/strategy \
+  -H "Content-Type: application/json" \
+  -d '{"strategy": "least_response_time"}'
+
+curl -X POST localhost:9090/admin/backends/1/degrade   # fake an outage on backend2
+
+for i in {1..8}; do curl -s localhost:8080/ | jq .backend; done
+# backend2 stops appearing immediately
+
+curl -s localhost:9090/admin/status | jq '.backends[] | {url, avg_latency_ms}'
+```
+
+Full strategy list and admin API reference are in the [repo README](https://github.com/riorhezaharris/load-balancer).

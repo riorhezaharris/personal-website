@@ -45,7 +45,7 @@ export const projects: Project[] = [
     title: "Load Balancer",
     oneLiner: "Zero-downtime failover across backend nodes.",
     githubUrl: "https://github.com/riorhezaharris/load-balancer",
-    status: "coming-soon",
+    status: "written",
     featured: false,
   },
   {
