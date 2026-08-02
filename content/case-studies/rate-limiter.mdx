@@ -5,24 +5,83 @@ oneLiner: "A boundary-exploitation flaw, found and fixed."
 
 ## The problem
 
-Placeholder — plain-language framing of the real-world scenario this project solves, no jargon in the opening.
+Say you run a public API — a login endpoint, an SMS/OTP sender, anything a client can call over and over. Without a limiter, one client can call it as fast as their network allows: a retry loop with no backoff, a scraper, a bug in someone else's client code, or someone deliberately hammering the endpoint. Whatever the cause, that one client can burn through the same database connections, CPU, and downstream quota that every other client depends on.
+
+The fix sounds simple: count each client's requests, and once they hit some number in some time window, start saying no. But *how* you count "requests in a window" turns out to matter a lot more than it looks. This project implements four different counting strategies — Token Bucket, Leaky Bucket, Fixed Window Counter, Sliding Window Counter — side by side behind the same interface, specifically so their differences are visible in running code and provable in a test, not just asserted in a blog post.
 
 ## Why it matters
 
-Placeholder — the "teaches you something real" story: an actual security flaw and the proof of the fix.
+The most common way to implement a rate limiter — reset a counter every N seconds — has a hole you can drive a truck through: it only limits requests *within* a window, not around its edges. A client that understands the clock can fire `limit` requests in the last instant of one window and `limit` more in the first instant of the next, and get roughly double the intended rate through in a very short span. This project doesn't just claim that — `fixedwindow_test.go` reproduces it as a passing test (`TestBoundaryExploitation`), and `slidingwindow_test.go` proves the fix closes it (`TestResolvesExploitation`).
+
+I've run into this exact class of bug in payments-adjacent work, where "requests" are really money movements: a naive window reset is the kind of thing that looks fine in a demo and only shows its teeth once someone figures out the clock is part of the attack surface. Get it wrong on a disbursement or OTP endpoint and "10 requests per 10 seconds" quietly becomes "20 requests per 10 seconds" for anyone who bothers to look at the boundary — and unlike a slow page load, that's not a bug someone notices and shrugs off, it's a bug someone can profit from.
 
 ## Key design decisions
 
-Placeholder — the ADRs from `docs/adr/` in the rate-limiter repo, narrativized for a mixed technical/non-technical reader.
+**Fixed Window ships with its bug intact, on purpose.** Rather than hiding the naive approach, the project keeps it as the baseline everything else is compared against, with a test that fires `limit` requests at the end of one window and `limit` more at the start of the next and asserts that all of them get through — 2x the intended rate, reproduced on demand rather than described in prose.
+
+```
+limit = 5, window = 3s
+
+Window 1 [0s ─────────────────────── 3s) Window 2 [3s ─────────────────────── 6s)
+                                  ●●●●●│●●●●●
+                                       │
+                                 boundary at 3s
+Fixed Window:    counts reset to 0 at 3s → both clusters allowed → 10 through in <1s
+Sliding Window:  Window 2's estimate still carries Window 1's weight → throttled
+```
+
+**Sliding Window fixes it with interpolation, not a request log.** The precise fix — log every request timestamp, count how many fall in the trailing window — has unbounded memory growth as a cost: memory scales with request volume, not with the number of clients. Instead, this implementation keeps two fixed windows (previous and current) per key and blends them:
+
+```
+rate = round(prevCount × weight) + currCount
+weight = 1 − elapsed_in_current_window / window_size
+```
+
+That caps memory at two integers per key regardless of traffic, at the cost of an approximation — the boundary isn't exact, it's estimated from how much of the current window has elapsed. For "protect the system," rather than "produce a forensically exact count," that's the right trade.
+
+**Leaky Bucket rejects, it doesn't queue.** The textbook version holds excess requests in a queue and drains them at a steady rate. Over HTTP, "queue the request" means holding a client's connection open while it waits its turn — which is its own attack surface (a slow-response vector) and needs goroutine and bounded-queue bookkeeping to do safely. This implementation tracks a `level` that fills on each request and drains continuously based on elapsed time (`level -= elapsed × drainRate`), and rejects immediately once a request would push it over capacity. Same guarantee — a strictly bounded output rate — with an instant decision and no queue to manage.
+
+**Token Bucket refills lazily, computed at request time.** There's no ticker topping up every client's balance in the background. When a request lands, the code multiplies elapsed time since that key's last request by the refill rate, adds it to the token count (capped at capacity), and only then decides allow/deny. A ticker-based version needs either a goroutine per key — doesn't scale — or a global sweep doing pointless work refilling clients who haven't sent a request in an hour. Lazy refill costs nothing for an idle client and needs no cleanup when a client disappears.
+
+**Each algorithm owns its state via a per-key mutex, not one global lock.** All four limiters hold their state in a `sync.Map` keyed by client identity, where each entry embeds its own `sync.Mutex`. Two different clients hitting the same algorithm never block each other — they're not touching the same lock. `go test -race ./...` passes clean, which is the actual claim being made here, not just "it should be thread-safe."
+
+**Client identity is a caller-supplied function, not a hardcoded IP lookup.** The `KeyExtractor` type is `func(r *http.Request) string`. The default extracts IP (`X-Forwarded-For` if present, else the connection's remote address); a `HeaderExtractor` variant reads an arbitrary header for cases like "rate limit by authenticated user ID, not IP." The tradeoff is explicit rather than hidden: the library doesn't decide what "identity" means, so a caller who points it at a client-controlled, unauthenticated header gets a rate limiter that's trivially bypassed by spoofing that header. That's a caller mistake the library makes possible, not one it prevents.
 
 ## What I'd do differently
 
-Placeholder — pulled from the "Known Trade-offs" section already in the repo's README.
+**The Store interface exists in the code but isn't actually wired to anything — the "swap the backend" story doesn't hold up.** `ratelimiter/store.go` defines a `Store` interface, and there are working implementations for both in-memory (`ratelimiter/memory`) and Redis (`ratelimiter/redis`, via go-redis). But none of the four `Limiter` implementations — `tokenbucket`, `leakybucket`, `fixedwindow`, `slidingwindow` — take a `Store` as a dependency. Each one keeps its own private `sync.Map` of state internally. In `cmd/server/main.go`, the store gets constructed and then explicitly discarded: `_ = memory.New(time.Minute)` and `_ = redisstore.New(redisAddr)`. Setting `STORE=redis` changes which client gets constructed and logged, and nothing else — no limiter ever calls a method on it. So the multi-instance story this project seems to set up for doesn't exist yet: every limiter's state lives only in that process's memory, Redis env var or not. This is the gap I'd close first, and it's not a small wiring fix either — the `Store` interface is `int64`-typed (`Get`, `Set`, `Increment`, `GetWithSet`), while token bucket and leaky bucket track `float64` state (fractional tokens, a fractional fill level). Making the store swap real means either widening the interface or accepting a precision loss neither algorithm currently has.
+
+- **The sliding window's approximation error is a real one, not just a rounding footnote.** It's fine for "stop abuse," but it is not the right tool for something like billing enforcement, where "approximately correct" isn't a valid answer — that use case needs either the request-log approach this design deliberately traded away, or a different structure entirely (e.g., a sorted set with periodic compaction).
+- **No observability surface.** There's no endpoint or log line that answers "why did this specific client just get a 429" beyond the response headers on that one request — no way to inspect a key's current state, no metrics export, no per-route or per-tenant limits. Everything is one global configuration set via environment variables at startup.
+- **The demo script and the test suite are the only correctness evidence — there's no load or soak test.** The race detector proves there's no data race under `go test -race`, which is a real guarantee, but it says nothing about behavior under sustained concurrent load at the volumes a real deployment would see.
 
 ## Try it yourself
 
-Placeholder — link to the repo and a quick-start command.
-
 ```bash
 git clone https://github.com/riorhezaharris/rate-limiter
+cd rate-limiter
+docker-compose up --build
 ```
+
+That starts the server on `:8080` with in-memory storage. Hit any of the four algorithms directly:
+
+```bash
+curl -i -X POST http://localhost:8080/token-bucket/request
+curl -i -X POST http://localhost:8080/fixed-window/request
+```
+
+Or run the demo script, which fires a normal burst, an over-limit burst, and then the boundary-exploitation attack against Fixed Window and Sliding Window side by side, and prints allow/deny live:
+
+```bash
+# terminal 1
+RATE_LIMIT=5 WINDOW_SIZE=3s go run ./cmd/server
+
+# terminal 2
+RATE_LIMIT=5 WINDOW_SIZE=3s bash scripts/demo.sh
+```
+
+This is an actual recording of that script running against the real server — Fixed Window letting a client double its rate across the boundary, Sliding Window cutting it off:
+
+![Boundary exploitation demo: Fixed Window lets a client double its rate across a window boundary; Sliding Window throttles the same attack](/case-studies/rate-limiter/demo.gif)
+
+Full source is in the repo, including `go test -race ./...` for the test suite backing the claims made here.
