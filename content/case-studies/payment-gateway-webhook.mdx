@@ -5,24 +5,79 @@ oneLiner: "Webhook handling for financial events under real compliance constrain
 
 ## The problem
 
-Placeholder — plain-language framing of the real-world scenario this project solves, no jargon in the opening.
+Imagine a customer pays for something, Stripe successfully charges their card, and Stripe sends your server a notification: *"this payment succeeded, go mark the order as paid."* Now imagine your database happens to be down for the ten or twenty seconds that notification arrives.
+
+Handle that badly and the money has moved but your system never found out. The customer paid, the order still says "unpaid," and someone finds out from a support ticket instead of from their own monitoring.
+
+This project is a working demonstration of how to make that scenario a non-event: a Go webhook receiver that keeps accepting Stripe-style payment events correctly even while its Postgres database is actively failing over from one node to another — with zero events lost and no human paged.
 
 ## Why it matters
 
-Placeholder — this one directly mirrors real job experience in payment systems, financial compliance, and high availability.
+Infrastructure fails, but money can't be allowed to fail with it. Disks die, nodes get rebooted, cloud providers have bad days — none of that is optional to plan for once real transactions are on the line. What makes payment webhooks specifically nasty is that the failure is silent by default: a dropped HTTP request doesn't throw an alarm, it just quietly leaves a paid order looking unpaid, and the gap only surfaces when a customer notices before you do.
+
+The interesting engineering question isn't "how do I add a database replica" — that part is a checkbox. It's "what does my application actually do in the twenty seconds where the database legitimately isn't there yet," because that's the window where most systems either lose data quietly or fall over loudly. This project is a self-contained way to show that specific decision has been thought through, end to end, rather than assumed away.
 
 ## Key design decisions
 
-Placeholder — the ADRs from `docs/adr/` in the payment-gateway-webhook repo, narrativized for a mixed technical/non-technical reader.
+**Routing writes to whichever database node is currently in charge.** When the primary Postgres node fails, a replica has to take over — but the application shouldn't need to know or care which node is which at any given moment. Three approaches exist: a floating virtual IP (Keepalived) that gets reassigned to the current primary; a connection pooler (PgBouncer) reconfigured via failover callbacks; or having the app poll Patroni's REST API directly and cache the result. This project uses **HAProxy in TCP mode sitting in front of Postgres**, continuously polling Patroni's REST API on each node (`GET /master`, expecting `200` only from the current leader) and routing all traffic to whichever backend answers. The app only ever talks to one stable address — `haproxy:5432` — for the life of the deployment. The cost is direct: HAProxy is now a new single point of failure on the database path, and that's a tradeoff worth naming rather than hiding.
+
+**What to do in the window where the database is unreachable.** This is the crux of the whole project. Three options existed: hold the HTTP request open and quietly retry the insert until the database comes back; buffer the event in memory and flush it once the database recovers; or reject the request outright. The handler does the third — on any database error it returns `503` immediately, with no retry and no buffering (`app/handler.go`). That sounds like giving up, but it isn't: Stripe treats `503` as a transient failure and retries with exponential backoff for up to three days, so the durability guarantee is inherited from Stripe's own delivery contract instead of invented from scratch. Buffering in memory looks safer on paper but is actually worse — if the app instance itself restarts while events sit in memory, they're gone, silently, which undermines the entire guarantee this system exists to provide. Leaning on Stripe's retry contract keeps every app instance genuinely stateless and removes an entire class of bugs that would otherwise need to be written and tested by hand.
+
+**Handling duplicate deliveries as the normal case, not an edge case.** Because Stripe *will* redeliver events — that's the direct consequence of retrying on `503` — the system has to treat duplicate delivery as expected traffic. Every event carries Stripe's own event ID, enforced as a `UNIQUE` constraint on `webhook_events.stripe_event_id`, and the insert is `INSERT ... ON CONFLICT (stripe_event_id) DO NOTHING`. There's no deduplication logic anywhere in the application layer — the guarantee lives in the one place that can actually enforce it atomically under concurrent writes from two app instances.
+
+**Deciding what not to fix.** The load balancer in front of the app instances (Nginx) is still a single point of failure in this topology, and it's left that way deliberately. Eliminating it requires either a floating-IP setup that Docker Desktop can't support without real networking workarounds, or a cloud-native load balancer that isn't something you can run locally at all. Rather than fake a fix that wouldn't reflect a real deployment, this is an explicit, acknowledged gap: in production, this tier gets handed to the cloud provider's managed LB, which is highly available by construction.
+
+```
+Stripe / demo.sh
+       │
+       ▼
+   ┌────────┐   round-robin, no health-aware routing
+   │ nginx  │   (acknowledged SPOF)
+   └───┬────┘
+       │
+   ┌───┴────┐
+   ▼        ▼
+ app1      app2      stateless — all state lives in Postgres
+   │        │
+   └───┬────┘
+       ▼
+  ┌──────────┐  polls Patroni's REST API on both nodes,
+  │ haproxy  │  routes only to the one answering 200 on /master
+  └────┬─────┘
+       │
+  ┌────┴─────┐
+  ▼          ▼
+primary    replica    Patroni-managed, promotion via etcd
+  │          │         leader election (3-node quorum)
+  └────┬─────┘
+       ▼
+     etcd (x3)
+```
 
 ## What I'd do differently
 
-Placeholder — pulled from the "Known Trade-offs" section already in the repo's README.
+- **The load balancer SPOF is real, not just theoretical for this demo.** In an actual production system this wouldn't be bare Nginx — it'd be behind a cloud LB from day one, or run as a VRRP pair. It's the one piece of this architecture that shouldn't ship into a real payment path exactly as-is.
+
+- **HAProxy is a new SPOF traded in for an old one.** Routing "which node is primary" got solved cleanly, but HAProxy itself now needs to be highly available too — in production that means a pair with VRRP or a managed proxy layer, scoped out here to keep the whole thing runnable on a laptop.
+
+- **Running the demo through a second failover cycle exposes a real bug, not a hypothetical one.** After `make restore-primary`, the old primary correctly rejoins the cluster as a Patroni replica (verified via its own REST API — `role: replica`, `state: running`, streaming from the new leader). But its Docker Compose healthcheck is hardcoded to `GET /master`, which was correct at first boot when it actually was the primary, and stays wrong forever after the first real role swap — the container reports `unhealthy` in `docker compose ps` even though it's a fully functional, correctly replicating node. HAProxy's own health checks are unaffected (it polls `/master` against both nodes independently and routes correctly regardless), so writes keep succeeding — this only breaks Compose's own status reporting and its `depends_on: condition: service_healthy` gate on a second cycle. Nothing in the READMEs or ADRs calls this out; it only surfaces by actually running the failover-and-restore cycle twice, which is exactly what happened while producing the recording below.
+
+- **The 503-and-retry strategy is a bet on Stripe's specific retry contract.** It's a good bet — three days of exponential backoff is generous — but it couples this design to Stripe's delivery semantics specifically. A webhook source with a shorter or less reliable retry window would need a different answer, probably closer to the buffering approach rejected here, with the durability problem solved a different way (e.g. a durable local queue instead of an in-memory one).
+
+- **This is a demo topology, not a deployment.** Three etcd nodes and two Postgres nodes on a single Docker host prove the failover mechanics; they don't prove behavior under real network partitions, cross-AZ latency, or actual production load. The next honest step is running this on separate hosts and testing partition scenarios, not just container kills.
 
 ## Try it yourself
 
-Placeholder — link to the repo and a quick-start command.
+The whole thing runs locally in a few minutes, and the failover is genuinely visible while it happens — requests return `200`, flip to `503` for the duration of the failover window, then come back to `200` from the newly-promoted node, with an HAProxy dashboard showing the handoff live.
 
 ```bash
 git clone https://github.com/riorhezaharris/payment-gateway-webhook
+cd payment-gateway-webhook
+make up              # boots the full stack: app cluster, HAProxy, Patroni, etcd
+make demo            # terminal 1: continuous signed webhook stream
+make kill-primary    # terminal 2: kill the DB primary, watch it recover
 ```
+
+Across several live test runs, the outage window between the last `200` before the kill and the first `200` after promotion measured 27–35 seconds — consistent with Patroni's configured 30-second leader TTL, and with the read that the old primary's lock generally has to expire rather than being released instantly on `docker compose stop`:
+
+![Terminal recording of the failover demo: signed webhook requests stream in returning 200 OK alternating between app1 and app2, `make kill-primary` stops the Postgres primary once the replica reports healthy, the stream flips to 503 for roughly 30 seconds while Patroni promotes the replica through etcd leader election, then recovers to 200 OK from the newly-promoted node with zero events lost](/case-studies/payment-gateway-webhook/failover.gif)
