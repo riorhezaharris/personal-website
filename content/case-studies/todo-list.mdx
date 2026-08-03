@@ -90,3 +90,5 @@ cd frontend && npm install && npm run dev
 ```
 
 Open `http://localhost:5173` in two browser tabs, join the same list from both, then use the **Simulate Partition** button on one tab. Add conflicting todos on both sides, click **Heal Partition**, and watch both tabs converge to the same state live.
+
+Full source, including the CRDT merge logic and sync handler, is in the [repo](https://github.com/riorhezaharris/todo-list).

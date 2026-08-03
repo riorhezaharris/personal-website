@@ -85,3 +85,5 @@ make kill-primary    # terminal 2: kill the DB primary, watch it recover
 Across several live test runs, the outage window between the last `200` before the kill and the first `200` after promotion measured 27–35 seconds — consistent with Patroni's configured 30-second leader TTL, and with the read that the old primary's lock generally has to expire rather than being released instantly on `docker compose stop`:
 
 ![Terminal recording of the failover demo: signed webhook requests stream in returning 200 OK alternating between app1 and app2, `make kill-primary` stops the Postgres primary once the replica reports healthy, the stream flips to 503 for roughly 30 seconds while Patroni promotes the replica through etcd leader election, then recovers to 200 OK from the newly-promoted node with zero events lost](/case-studies/payment-gateway-webhook/failover.gif)
+
+The full Makefile targets and architecture notes are in the [repo README](https://github.com/riorhezaharris/payment-gateway-webhook).
