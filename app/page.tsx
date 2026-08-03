@@ -23,8 +23,8 @@ export default function HomePage() {
               and write up how I built them.
             </h1>
             <p className="max-w-xl text-lg leading-relaxed text-ink-muted">
-              Placeholder positioning statement — one paragraph on what I do, who
-              I&apos;ve built it for, and what I&apos;m looking for next.
+              Senior Backend Engineer, 5 years in fintech. Building outside the day
+              job to prove depth at the next level.
             </p>
             <div className="flex flex-wrap gap-4 pt-2">
               <Link

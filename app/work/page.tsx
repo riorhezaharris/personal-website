@@ -11,10 +11,9 @@ export default function WorkPage() {
   return (
     <div className="mx-auto max-w-5xl px-6 py-20">
       <h1 className="font-serif text-4xl text-ink">Work</h1>
-      <p className="mt-4 max-w-xl text-lg text-ink-muted">
-        Nine systems exploring problems I don&apos;t get to touch day-to-day
-        in production. Each one gets a full case study — the thinking, not
-        just the repo.
+      <p className="mt-4 max-w-xl text-lg text-ink-muted text-justify">
+        Nine systems, each going deeper into problems I face in production.
+        Each one gets a full case study — the thinking, not just the repo.
       </p>
       <div className="mt-12 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
         {projects.map((project) => (

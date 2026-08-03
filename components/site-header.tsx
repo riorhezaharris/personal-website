@@ -32,11 +32,10 @@ export function SiteHeader() {
                 key={link.href}
                 href={link.href}
                 aria-current={isActive ? "page" : undefined}
-                className={`relative rounded-md px-3 py-2 font-medium transition-colors ${
-                  isActive
+                className={`relative rounded-md px-3 py-2 font-medium transition-colors ${isActive
                     ? "text-accent"
                     : "text-ink-muted hover:text-ink"
-                }`}
+                  }`}
               >
                 {link.label}
                 {isActive && (
@@ -46,7 +45,7 @@ export function SiteHeader() {
             );
           })}
           <a
-            href="/resume.pdf"
+            href="/CV-RioRhezaHarris.pdf"
             download
             className="ml-2 rounded-md border border-border px-3 py-2 font-medium text-ink-muted transition-colors hover:border-accent hover:text-accent"
           >
