@@ -31,7 +31,10 @@ export const caseStudyMdxComponents: MDXComponents = {
     </pre>
   ),
   code: ({ children, ...props }) => (
-    <code className="font-mono text-[0.9em]" {...props}>
+    <code
+      className="rounded-md bg-ink/10 px-1.5 py-0.5 font-mono text-[0.85em] text-ink [pre_&]:bg-transparent [pre_&]:p-0 [pre_&]:text-code-fg"
+      {...props}
+    >
       {children}
     </code>
   ),

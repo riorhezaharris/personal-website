@@ -29,28 +29,32 @@ The interesting engineering question isn't "how do I add a database replica" —
 
 ```
 Stripe / demo.sh
-       │
-       ▼
-   ┌────────┐   round-robin, no health-aware routing
-   │ nginx  │   (acknowledged SPOF)
-   └───┬────┘
-       │
-   ┌───┴────┐
-   ▼        ▼
+       |
+       v
+   +--------+   round-robin, no health-aware routing
+   | nginx  |   (acknowledged SPOF)
+   +---+----+
+       |
+   +---+----+
+   |        |
+   v        v
  app1      app2      stateless — all state lives in Postgres
-   │        │
-   └───┬────┘
-       ▼
-  ┌──────────┐  polls Patroni's REST API on both nodes,
-  │ haproxy  │  routes only to the one answering 200 on /master
-  └────┬─────┘
-       │
-  ┌────┴─────┐
-  ▼          ▼
+   |        |
+   +---+----+
+       |
+       v
+  +----------+  polls Patroni's REST API on both nodes,
+  | haproxy  |  routes only to the one answering 200 on /master
+  +----+-----+
+       |
+  +----+-----+
+  |          |
+  v          v
 primary    replica    Patroni-managed, promotion via etcd
-  │          │         leader election (3-node quorum)
-  └────┬─────┘
-       ▼
+  |          |         leader election (3-node quorum)
+  +----+-----+
+       |
+       v
      etcd (x3)
 ```
 

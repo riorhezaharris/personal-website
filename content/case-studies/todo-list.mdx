@@ -15,21 +15,21 @@ This project is a working answer to that question — a todo list where two peop
 
 ```
            Network Partition
-                  │
-    ┌─────────────┼─────────────┐
-    │             │             │
- [Tab 1]          │           [Tab 2]
- adds todos       │           adds todos
- offline          │           offline
-    │             │             │
-    └─────────────┼─────────────┘
-                  │
+                  |
+    +-------------+-------------+
+    |             |             |
+ [Tab 1]          |           [Tab 2]
+ adds todos       |           adds todos
+ offline          |           offline
+    |             |             |
+    +-------------+-------------+
+                  |
               Partition
                Heals
-                  │
+                  |
          Automatic Merge
          (OR-Set + LWW)
-                  │
+                  |
          Both sides converge
          — nothing lost
 ```

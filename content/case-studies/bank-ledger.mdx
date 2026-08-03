@@ -42,11 +42,12 @@ This is the Branch C question from the opening, played out as a timeline:
 
 ```
 t=0ms      Cable gets cut. Node3 can no longer reach node1 or node2.
-             │
+             |
 t=500ms    Node3 pings its peers → no response (miss #1)
 t=1000ms   Node3 pings its peers → no response (miss #2)
 t=1500ms   Node3 pings its peers → no response (miss #3)
-             ▼
+             |
+             v
            canWrite = false
            Node3 now rejects every write with 503, on its own,
            before a single client ever hits the problem.
@@ -55,13 +56,15 @@ t=1500ms   Node3 pings its peers → no response (miss #3)
              .    keeps taking writes; node3 just isn't part of it)
              .
 t=Xms      Cable gets reconnected.
-             │
+             |
 t=X+500ms  Node3's heartbeat reaches node1/node2 again
-             ▼
+             |
+             v
            resync()
            Node3 pulls every transaction committed since its own
            last known committed_at from a live peer, and blocks.
-             ▼
+             |
+             v
            canWrite = true
            Only now — caught up, not just reconnected — does
            node3 rejoin quorum and serve writes/reads again.

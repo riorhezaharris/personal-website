@@ -22,9 +22,9 @@ I've run into this exact class of bug in payments-adjacent work, where "requests
 ```
 limit = 5, window = 3s
 
-Window 1 [0s ─────────────────────── 3s) Window 2 [3s ─────────────────────── 6s)
-                                  ●●●●●│●●●●●
-                                       │
+Window 1 [0s ----------------------- 3s) Window 2 [3s ----------------------- 6s)
+                                  *****|*****
+                                       |
                                  boundary at 3s
 Fixed Window:    counts reset to 0 at 3s → both clusters allowed → 10 through in <1s
 Sliding Window:  Window 2's estimate still carries Window 1's weight → throttled
